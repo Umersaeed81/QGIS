@@ -1,0 +1,351 @@
+```python
+# ===============================
+# QGIS: Flexible Filter Column → Unique Values → KPI → Create & Color Points + Legend + Site Search
+# ===============================
+
+from qgis.PyQt.QtWidgets import (
+    QDockWidget, QWidget, QVBoxLayout, QLabel, QListWidget, QPushButton,
+    QHBoxLayout, QListWidgetItem, QLineEdit, QComboBox, QCheckBox, QFileDialog
+)
+from qgis.PyQt.QtCore import Qt, QVariant
+from qgis.PyQt.QtGui import QColor, QFont
+from qgis.core import (
+    QgsVectorLayer, QgsProject, QgsFeature, QgsGeometry, QgsPointXY,
+    QgsFields, QgsField, QgsRuleBasedRenderer, QgsSymbol
+)
+from qgis.utils import iface
+import csv, os
+from collections import Counter
+
+# ===============================
+# Parameters
+# ===============================
+default_path = r"C:/Users/UWX161178/QGIS_Tool_Processer"
+default_file = "61_TNL_EX_Outage_24082025.csv"
+csv_file = os.path.join(default_path, default_file)
+POINT_LAYER_NAME_PREFIX = "Sites_Points"
+
+# ===============================
+# Helpers (CSV reading, classification, symbology)
+# ===============================
+def read_fieldnames(csv_path):
+    try:
+        with open(csv_path, newline='', encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            return reader.fieldnames or []
+    except Exception:
+        return []
+
+def get_filter_columns(csv_path):
+    fn = read_fieldnames(csv_path)
+    if not fn:
+        return []
+    exclude = {"Latitude", "Longitude", "LTE_Site_ID", "Date"}
+    return [c for c in fn if c not in exclude]
+
+def get_unique_values(csv_path, column):
+    vals = set()
+    try:
+        with open(csv_path, newline='', encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                v = (row.get(column) or "").strip()
+                if v:
+                    vals.add(v)
+    except Exception:
+        pass
+    return sorted(vals)
+
+def classify_value(v):
+    try:
+        val = float(v)
+    except Exception:
+        return "Unknown"
+    if val < 200:
+        return "Low (<200)"
+    elif 200 <= val < 500:
+        return "Medium (200–499)"
+    else:
+        return "High (>=500)"
+
+def make_points_layer(kpi_col, filter_field, date_field=True):
+    fields = QgsFields()
+    fields.append(QgsField("LTE_Site_ID", QVariant.String))
+    fields.append(QgsField(kpi_col, QVariant.Double))
+    fields.append(QgsField("KPI_Class", QVariant.String))
+    fields.append(QgsField(filter_field, QVariant.String))
+    if date_field:
+        fields.append(QgsField("Date", QVariant.String))
+
+    lyr = QgsVectorLayer("Point?crs=EPSG:4326", "temp", "memory")
+    dp = lyr.dataProvider()
+    dp.addAttributes(fields)
+    lyr.updateFields()
+    return lyr
+
+def apply_symbology(layer_points, kpi_col):
+    try:
+        symbol_red = QgsSymbol.defaultSymbol(layer_points.geometryType())
+        symbol_red.setColor(QColor(255, 0, 0))
+        rule_red = QgsRuleBasedRenderer.Rule(symbol_red, filterExp=f'"{kpi_col}" >= 500', label="High (>=500)")
+
+        symbol_yellow = QgsSymbol.defaultSymbol(layer_points.geometryType())
+        symbol_yellow.setColor(QColor(255, 255, 0))
+        rule_yellow = QgsRuleBasedRenderer.Rule(symbol_yellow, filterExp=f'"{kpi_col}" >= 200 AND "{kpi_col}" < 500', label="Medium (200–499)")
+
+        symbol_green = QgsSymbol.defaultSymbol(layer_points.geometryType())
+        symbol_green.setColor(QColor(0, 255, 0))
+        rule_green = QgsRuleBasedRenderer.Rule(symbol_green, filterExp=f'"{kpi_col}" < 200', label="Low (<200)")
+
+        root_rule = QgsRuleBasedRenderer.Rule(None)
+        root_rule.appendChild(rule_red)
+        root_rule.appendChild(rule_yellow)
+        root_rule.appendChild(rule_green)
+
+        renderer = QgsRuleBasedRenderer(root_rule)
+        layer_points.setRenderer(renderer)
+    except Exception as e:
+        print("apply_symbology error:", e)
+
+def build_points_for_filter(csv_path, filter_field, allowed_values, kpi_col, allowed_dates):
+    layer_points = make_points_layer(kpi_col, filter_field, date_field=True)
+    dp = layer_points.dataProvider()
+    feats = []
+    counts = Counter()
+    try:
+        with open(csv_path, newline='', encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                val = (row.get(filter_field) or "").strip()
+                date_val = (row.get("Date") or "").strip()
+                if allowed_values and val not in allowed_values:
+                    continue
+                if allowed_dates and date_val not in allowed_dates:
+                    continue
+                try:
+                    lon = float(row["Longitude"])
+                    lat = float(row["Latitude"])
+                    raw = row.get(kpi_col, "")
+                    if raw in (None, ""):
+                        continue
+                    kpi_value = float(raw)
+                except Exception:
+                    continue
+                site = row.get("LTE_Site_ID", "") or ""
+                cls = classify_value(kpi_value)
+                feat = QgsFeature(layer_points.fields())
+                feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+                feat.setAttributes([site, kpi_value, cls, val, date_val])
+                feats.append(feat)
+                counts[val if val else "(blank)"] += 1
+    except Exception as e:
+        print("CSV read error:", e)
+
+    if feats:
+        dp.addFeatures(feats)
+        layer_points.updateExtents()
+
+    apply_symbology(layer_points, kpi_col)
+    return layer_points, counts
+
+# ===============================
+# Draggable Legend
+# ===============================
+canvas = iface.mapCanvas()
+proxy = None
+
+def create_legend(kpi_name):
+    global proxy
+    remove_legend()
+    from qgis.PyQt.QtWidgets import QLabel
+    legend = QLabel()
+    legend.isTrafficLegend = True
+    legend.setStyleSheet("background-color: white; border: 1px solid black; padding: 5px;")
+    legend.setFont(QFont("Arial", 10))
+    legend.setText(
+        f"Legend ({kpi_name})\n"
+        #"🟢 Low (<200)\n"
+        "🟡 Medium (200–499)\n"
+        "🔴 High (>=500)"
+    )
+    proxy = canvas.scene().addWidget(legend)
+    legend.adjustSize()
+    proxy.setPos(canvas.width() - legend.width() - 20,
+                 canvas.height() - legend.height() - 20)
+
+    def proxyMousePressEvent(event):
+        proxy.dragPos = event.scenePos()
+    def proxyMouseMoveEvent(event):
+        if event.buttons() == Qt.LeftButton:
+            delta = event.scenePos() - proxy.dragPos
+            proxy.setPos(proxy.pos() + delta)
+            proxy.dragPos = event.scenePos()
+    proxy.mousePressEvent = proxyMousePressEvent
+    proxy.mouseMoveEvent = proxyMouseMoveEvent
+
+def remove_legend():
+    global proxy
+    if proxy:
+        proxy.setParentItem(None)
+        proxy = None
+
+def on_layer_added(layer):
+    if layer.name().startswith(POINT_LAYER_NAME_PREFIX):
+        create_legend(layer.renderer().classificationAttribute() if hasattr(layer.renderer(), 'classificationAttribute') else "KPI")
+
+def on_layer_removed(layerId):
+    layer = QgsProject.instance().mapLayer(layerId)
+    if layer and layer.name().startswith(POINT_LAYER_NAME_PREFIX):
+        remove_legend()
+
+QgsProject.instance().layerWasAdded.connect(on_layer_added)
+QgsProject.instance().layerWillBeRemoved.connect(on_layer_removed)
+
+# ===============================
+# Dock UI
+# ===============================
+dock = QDockWidget("Filter & KPI (Create & Color Points)", iface.mainWindow())
+dock.setObjectName("DynamicFilterKPIDock")
+panel = QWidget()
+vbox = QVBoxLayout(panel)
+
+# --- CSV file input ---
+vbox.addWidget(QLabel("CSV File Path:"))
+txt_file = QLineEdit()
+txt_file.setText(csv_file)
+vbox.addWidget(txt_file)
+btn_browse = QPushButton("Browse...")
+def browse_file():
+    fname, _ = QFileDialog.getOpenFileName(None, "Select CSV File", default_path, "CSV Files (*.csv)")
+    if fname:
+        txt_file.setText(fname)
+        refresh_columns()
+btn_browse.clicked.connect(browse_file)
+vbox.addWidget(btn_browse)
+
+# --- Filter column ---
+cmb_field = QComboBox()
+vbox.addWidget(QLabel("1) Select Filter Column (Region / City / SubRegion / ...):"))
+vbox.addWidget(cmb_field)
+
+# --- Values list ---
+vbox.addWidget(QLabel("2) Select Values (Ctrl/Shift for multi-select). Leave none to select ALL:"))
+lst_values = QListWidget()
+lst_values.setSelectionMode(QListWidget.MultiSelection)
+vbox.addWidget(lst_values)
+
+# --- Dates list ---
+vbox.addWidget(QLabel("2b) Select Dates (Ctrl/Shift for multi-select). Leave none to select ALL:"))
+lst_dates = QListWidget()
+lst_dates.setSelectionMode(QListWidget.MultiSelection)
+vbox.addWidget(lst_dates)
+
+# --- KPI selection ---
+cmb_kpi = QComboBox()
+vbox.addWidget(QLabel("3) Select KPI column to color by:"))
+vbox.addWidget(cmb_kpi)
+
+# --- Legend checkbox ---
+chk_legend = QCheckBox("Show Legend")
+chk_legend.setChecked(True)
+vbox.addWidget(chk_legend)
+
+# --- Buttons ---
+btn_row = QHBoxLayout()
+btn_apply = QPushButton("Apply Filter & Color Points")
+btn_clear = QPushButton("Clear Selection")
+btn_row.addWidget(btn_apply)
+btn_row.addWidget(btn_clear)
+vbox.addLayout(btn_row)
+
+dock.setWidget(panel)
+iface.addDockWidget(Qt.RightDockWidgetArea, dock)
+
+# ===============================
+# Refresh columns/values based on CSV
+# ===============================
+def refresh_columns():
+    global csv_file
+    csv_file = txt_file.text()
+    cmb_field.clear()
+    cmb_kpi.clear()
+    lst_values.clear()
+    lst_dates.clear()
+
+    columns = get_filter_columns(csv_file)
+    if not columns:
+        return
+
+    # --- Filter column default ---
+    filter_column_default = "Region" if "Region" in columns else next((c for c in columns if not all(s.replace('.','').isdigit() for s in get_unique_values(csv_file, c))), columns[0])
+    for c in columns:
+        cmb_field.addItem(c)
+    cmb_field.setCurrentText(filter_column_default)
+
+    # --- KPI default ---
+    numeric_cols = []
+    for c in columns:
+        try:
+            vals = get_unique_values(csv_file, c)
+            if all(v.replace('.','').isdigit() for v in vals if v):
+                numeric_cols.append(c)
+        except Exception:
+            continue
+    kpi_default = "TNL" if "TNL" in columns else (numeric_cols[0] if numeric_cols else columns[0])
+    for k in columns:
+        cmb_kpi.addItem(k)
+    cmb_kpi.setCurrentText(kpi_default)
+
+    # --- Values ---
+    refresh_values()
+
+    # --- Dates ---
+    lst_dates.clear()
+    for d in get_unique_values(csv_file, "Date"):
+        lst_dates.addItem(QListWidgetItem(d))
+
+def refresh_values():
+    lst_values.clear()
+    field = cmb_field.currentText()
+    if not field:
+        return
+    for v in get_unique_values(csv_file, field):
+        lst_values.addItem(QListWidgetItem(v))
+
+cmb_field.currentIndexChanged.connect(refresh_values)
+refresh_columns()
+
+def get_selected_values(widget):
+    return [it.text() for it in widget.selectedItems()]
+
+def on_apply():
+    filter_field = cmb_field.currentText()
+    selected_vals = get_selected_values(lst_values)
+    selected_dates = get_selected_values(lst_dates)
+    kpi_selected = cmb_kpi.currentText()
+    show_legend = chk_legend.isChecked()
+
+    layer, counts = build_points_for_filter(csv_file, filter_field, selected_vals, kpi_selected, selected_dates)
+    if not layer or layer.featureCount() == 0:
+        iface.messageBar().pushWarning("Filter", "No features were created (check CSV columns / selections).")
+        return
+
+    name = f"{POINT_LAYER_NAME_PREFIX} ({kpi_selected}, {filter_field}, {len(selected_dates) or 'All'} dates)"
+    layer.setName(name)
+    QgsProject.instance().addMapLayer(layer)
+
+    if show_legend:
+        create_legend(kpi_selected)
+    else:
+        remove_legend()
+
+    iface.messageBar().pushInfo("Filter Applied", f"Loaded {layer.featureCount()} sites -> {name}")
+
+def on_clear():
+    lst_values.clearSelection()
+    lst_dates.clearSelection()
+
+btn_apply.clicked.connect(on_apply)
+btn_clear.clicked.connect(on_clear)
+
+```
